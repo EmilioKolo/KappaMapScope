@@ -1,0 +1,8 @@
+# Base bioinformatics tools
+numpy==2.2.6
+
+# SAM/BAM processing
+pysam==0.23.3
+
+# Plotting
+matplotlib==3.10.8
