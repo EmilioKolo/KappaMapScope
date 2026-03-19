@@ -2,6 +2,8 @@
 
 Calculates the mappability of a DNA sequence over different values of k and makes a figure of it.
 
+Includes a separate script to plot the mappability setting limits and log-scales.
+
 # Requirements
 
 Tools: 
