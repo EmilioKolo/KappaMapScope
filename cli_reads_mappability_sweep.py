@@ -25,8 +25,8 @@ def generate_kmers_from_reads(fastq, k, out_fasta):
             if not header:
                 break
             seq = fin.readline().strip()
-            fin.readline()  # +
-            fin.readline()  # qual
+            fin.readline() # +
+            fin.readline() # qual
 
             for j in range(len(seq) - k + 1):
                 out.write(f">read{i}_kmer{j}\n{seq[j:j+k]}\n")
@@ -62,7 +62,24 @@ def run_bowtie2(index, kmers_fasta, sam_out, threads):
         "-k", "2",
         "-p", str(threads)
     ]
+    print(f"[ALIGN] Running Bowtie2 on {kmers_fasta}")
     subprocess.run(cmd, check=True)
+    print(f"[ALIGN] Finished Bowtie2 → {sam_out}")
+
+
+def merge_intervals(intervals):
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if not merged or merged[-1][1] < start:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return merged
+
+
+def revcomp(seq):
+    return seq.translate(str.maketrans("ACGT", "TGCA"))[::-1]
 
 
 def compute_unique_coverage(sam_file, reference):
@@ -71,6 +88,8 @@ def compute_unique_coverage(sam_file, reference):
     """
     unique_reads = {}
     coverage = {}
+
+    print(f"[COVERAGE] Counting alignments in {sam_file}")
 
     with pysam.AlignmentFile(sam_file, "r") as sam:
         for read in sam.fetch(until_eof=True):
@@ -95,11 +114,17 @@ def compute_unique_coverage(sam_file, reference):
             end = read.reference_end
 
             if ref not in coverage:
-                coverage[ref] = set()
+                coverage[ref] = []
 
-            coverage[ref].update(range(start, end))
+            coverage[ref].append((start, end))
 
-    covered_bases = sum(len(v) for v in coverage.values())
+    covered_bases = 0
+    for ref in coverage:
+        merged = merge_intervals(coverage[ref])
+        for start, end in merged:
+            covered_bases += (end - start)
+
+    print(f"[COVERAGE] Covered bases: {covered_bases}")
 
     # approximate genome length from SAM header
     genome_length = read_fasta_lengths(reference)
@@ -110,13 +135,71 @@ def compute_unique_coverage(sam_file, reference):
 def compute_wrapper(args_tuple):
     fastq, k, index, prefix, threads, reference = args_tuple
 
+    print(f"[START] k={k}")
+
     kmers_fasta = f"{prefix}.k{k}.kmers.fa"
     sam_file = f"{prefix}.k{k}.sam"
 
-    generate_kmers_from_reads(fastq, k, kmers_fasta)
-    run_bowtie2(index, kmers_fasta, sam_file, threads)
+    print(f"[STREAM] Streaming k-mers directly to Bowtie2 for k={k}")
+
+    bowtie_cmd = [
+        "bowtie2",
+        "-x", index,
+        "-f", "-",                 # read from stdin
+        "-S", sam_file,
+        "--very-sensitive",
+        "-k", "2",
+        "-p", str(threads)
+    ]
+
+    proc = subprocess.Popen(
+        bowtie_cmd,
+        stdin=subprocess.PIPE,
+        text=True
+    )
+
+    seen_kmers = set()
+
+    # stream kmers
+    if fastq.endswith(".gz"):
+        fin_handle = gzip.open(fastq, "rt")
+    else:
+        fin_handle = open(fastq, "r")
+
+    with fin_handle as fin:
+        i = 0
+        for line in fin:
+            header = line
+            seq = fin.readline().strip()
+            fin.readline()
+            fin.readline()
+
+            for j in range(len(seq) - k + 1):
+                kmer = seq[j:j+k]
+                rc = revcomp(kmer)
+                canon = min(kmer, rc)
+
+                if canon in seen_kmers:
+                    continue
+
+                seen_kmers.add(canon)
+                proc.stdin.write(f">kmer_{len(seen_kmers)}\n{canon}\n")
+
+            i += 1
+
+            if i % 100000 == 0:
+                print(f"[STREAM] {i} reads processed")
+
+    print(f"[STREAM] Unique k-mers sent: {len(seen_kmers)}")
+
+    proc.stdin.close()
+    proc.wait()
+
+    print(f"[STREAM] Finished streaming k={k}")
 
     m = compute_unique_coverage(sam_file, reference)
+
+    print(f"[DONE] k={k} → mappability={m:.6f}")
 
     return (k, m)
 
@@ -153,6 +236,9 @@ def main():
         (args.input, k, args.index, args.output_prefix, args.threads, args.reference)
         for k in ks
     ]
+
+    print(f"[INFO] Running ks: {ks}")
+    print(f"[INFO] Processes: {args.processes}, Threads per job: {args.threads}")
 
     if args.processes > 1:
         with Pool(args.processes) as pool:
